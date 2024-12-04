@@ -17,7 +17,6 @@ from mmdet.utils import get_root_logger
 from mmdet.models.builder import BACKBONES
 
 from mmcv.runner import BaseModule
-from sklearn.cluster import KMeans
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -291,6 +290,49 @@ class PatchMerging(nn.Module):
 
         return x
 
+class SwinTransformerBlockWithMemory(nn.Module):
+    """ Swin Transformer Block with Memory Tokens.
+    """
+    def __init__(self, dim, num_heads, window_size, shift_size, mlp_ratio, qkv_bias, qk_scale, drop, attn_drop, drop_path, norm_layer):
+        super().__init__()
+        # Existing components of SwinTransformerBlock
+        self.norm1 = norm_layer(dim)
+        #改为HR-Pro中的transformer encoder
+        self.attn = WindowAttention(
+            dim, window_size, num_heads, qkv_bias, qk_scale, attn_drop, drop
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(dim, int(dim * mlp_ratio), drop)
+
+        # Memory tokens initialization (80 tokens as per your requirement)
+        self.num_memory_tokens = 80
+        self.memory_tokens = nn.Parameter(torch.zeros(1, self.num_memory_tokens, dim))  # 80 memory tokens
+
+    def forward(self, x, H, W):
+        """ Forward pass with image patches and memory tokens."""
+        B, L, C = x.shape
+#tokens 插在前面
+        # Step 1: Concatenate the image patches and memory tokens
+        memory_tokens = self.memory_tokens.expand(B, self.num_memory_tokens, C)  # B, 80, C
+        x = torch.cat([x, memory_tokens], dim=1)  # B, L + 80, C (Concatenating patches and memory tokens)
+
+        # Step 2: Perform attention with the combined tokens (image patches + memory tokens)
+        x = self.norm1(x)
+
+        attn_output = self.attn(x, H, W)  # Shape: B, L + 80, C
+        
+        # # Step 3: Apply DropPath
+        # x = x + self.drop_path(attn_output)  # Residual connection
+        
+        # # Step 4: MLP and another residual connection
+        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+#tokens 插在前面
+        # Step 5: Only keep the image patches (discard memory tokens)
+        x = x[:, :-self.num_memory_tokens, :]  # Keep only the patches, discard the memory tokens
+
+        return x, H, W  # Return only the image patches
+
 
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
@@ -435,483 +477,11 @@ class PatchEmbed(nn.Module):
 
         return x
 
-class DronePatchExtractor(nn.Module):
-    def __init__(self, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None, num_classes=80):
-        super().__init__()
-        self.patch_size = self.to_2tuple(patch_size)
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-        self.num_classes = num_classes
-
-        # 卷积操作，用于将图像划分为不重叠的patch
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
-        
-        # 位置编码
-        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, self.patch_size[0], self.patch_size[1]))
-
-        # 如果需要归一化
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
-
-    def to_2tuple(self, x):
-        return (x, x) if isinstance(x, int) else x
-
-    def extract_drone_patches_with_bbox(self, images, labels):
-        """
-        根据标签中的边界框提取包含Drone的patch。
-
-        Args:
-            images (Tensor): 输入的图像数据，形状为 [B, C, H, W]
-            labels (List[List[Tuple[int, int, int, int]]]): 每张图的目标边界框列表，
-                格式为 [(xmin, ymin, w, h), ...]，每个图像的标签是一个边界框的列表。
-
-        Returns:
-            List[Tensor]: 含有目标Drone的patch列表
-        """
-        drone_patches = []
-        patch_size = self.patch_size[0]
-
-        for img, bbox_list in zip(images, labels):
-            patches = self.forward(img.unsqueeze(0))  # 获取patch特征
-            h_img, w_img = img.shape[1:]  # 获取图像尺寸
-
-            # 遍历每个边界框（每张图可能有多个目标Drone）
-            for bbox in bbox_list:
-                xmin, ymin, w, h = bbox
-                xmax = xmin + w
-                ymax = ymin + h
-
-                # 遍历每个patch
-                for i in range(0, h_img - patch_size + 1, patch_size):
-                    for j in range(0, w_img - patch_size + 1, patch_size):
-                        # 计算当前patch的范围
-                        patch_x_min = j
-                        patch_y_min = i
-                        patch_x_max = j + patch_size
-                        patch_y_max = i + patch_size
-
-                        # 判断是否与目标范围有交集
-                        if not (patch_x_max <= xmin or patch_x_min >= xmax or
-                                patch_y_max <= ymin or patch_y_min >= ymax):
-                            # 如果有交集，将patch保存
-                            drone_patches.append(patches[0, :, i // patch_size, j // patch_size])
-
-        return drone_patches
-
-    def cluster_patches(self, drone_patches, num_clusters=80, batch_size=1000):
-        """
-        对Drone patches进行两阶段聚类，首先对patch进行批次聚类，然后对所有聚类结果再次聚类。
-
-        Args:
-            drone_patches (List[Tensor]): 待聚类的Drone patches列表
-            num_clusters (int): 聚类的数量
-            batch_size (int): 每次聚类处理的patch数量
-
-        Returns:
-            List[List[Tensor]]: 最终聚类后的patch列表，每个元素是一个集群中所有patch的列表
-        """
-        # 第一阶段聚类结果
-        clustered_patches = []  # 存储第一阶段聚类后的patch列表
-        patch_batch = []  # 用于存储当前批次的patch
-
-        # 遍历所有的patch
-        for i, patch in enumerate(drone_patches):
-            patch_batch.append(patch.flatten().cpu().numpy())  # 将每个patch展平并存储
-
-            # 一旦积累的patch数量达到batch_size，就进行一次聚类
-            if len(patch_batch) == batch_size or i == len(drone_patches) - 1:
-                # 将当前批次的所有patch特征堆叠成二维数组（每个patch的特征是一维的）
-                patch_features = np.stack(patch_batch)
-
-                # 执行KMeans聚类
-                kmeans = KMeans(n_clusters=num_clusters, random_state=42)
-                kmeans.fit(patch_features)
-
-                # 根据聚类结果将patch分组
-                for cluster_idx in range(num_clusters):
-                    cluster_patches = [drone_patches[j] for j in range(len(patch_batch)) if kmeans.labels_[j] == cluster_idx]
-                    clustered_patches.append(cluster_patches)
-
-                # 处理完当前批次后，清空patch_batch，释放内存
-                patch_batch.clear()
-
-        # 第二阶段聚类：对第一阶段得到的所有聚类结果进行二次聚类
-        # 将所有的集群patch展平为特征向量
-        all_cluster_patches = []
-        for cluster in clustered_patches:
-            for patch in cluster:
-                all_cluster_patches.append(patch.flatten().cpu().numpy())
-
-        # 进行第二阶段KMeans聚类
-        patch_features_final = np.stack(all_cluster_patches)
-        kmeans_final = KMeans(n_clusters=num_clusters, random_state=42)
-        kmeans_final.fit(patch_features_final)
-
-        # 将最终聚类的结果根据标签重新分组
-        final_clustered_patches = [[] for _ in range(num_clusters)]
-        for idx, label in enumerate(kmeans_final.labels_):
-            final_clustered_patches[label].append(all_cluster_patches[idx])
-
-        return final_clustered_patches
-
-    def forward(self, images, labels, num_clusters=80, batch_size=1000):
-        """
-        计算整个前向过程，包括提取Drone patches、聚类操作。
-
-        Args:
-            images (Tensor): 输入的图像数据，形状为 [B, C, H, W]
-            labels (List[List[Tuple[int, int, int, int]]]): 每张图的目标边界框列表，
-                格式为 [(xmin, ymin, w, h), ...]，每个图像的标签是一个边界框的列表。
-            num_clusters (int): 聚类的数量
-            batch_size (int): 每次聚类处理的patch数量
-
-        Returns:
-            List[List[Tensor]]: 最终聚类后的patch列表，每个元素是一个集群中所有patch的列表
-        """
-        # 步骤 1：根据标签提取Drone patches
-        drone_patches = self.extract_drone_patches_with_bbox(images, labels)
-
-        # 步骤 2：对提取的Drone patches进行聚类
-        clustered_patches = self.cluster_patches(drone_patches, num_clusters, batch_size)
-
-        return clustered_patches
-    
-
-class Reliabilty_Aware_Block(nn.Module):
-    def __init__(self, input_dim, dropout, num_heads=8, dim_feedforward=128):
-        super(Reliabilty_Aware_Block, self).__init__()
-        self.conv_query = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
-        self.conv_key = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
-        self.conv_value = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
-
-        self.self_atten = nn.MultiheadAttention(input_dim, num_heads=num_heads, dropout=0.1)
-        self.linear1 = nn.Linear(input_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, input_dim)
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, features, attn_mask=None):
-        src = features.permute(2, 0, 1)  # [T, B, F]
-        q = k = src
-        q = self.conv_query(features).permute(2, 0, 1)
-        k = self.conv_key(features).permute(2, 0, 1)
-
-        src2, attn = self.self_atten(q, k, src, attn_mask=attn_mask)
-
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-
-        src = src.permute(1, 2, 0)  # [B, F, T]
-        return src, attn
-
-
-# class Encoder(nn.Module):
-#     def __init__(self, args):
-#         super(Encoder, self).__init__()
-#         self.feature_dim = args.feature_dim  # 输入特征维度
-
-#         # RAB args
-#         RAB_args = args.RAB_args
-#         self.RAB = nn.ModuleList([
-#             Reliabilty_Aware_Block(
-#                 input_dim=self.feature_dim,
-#                 dropout=RAB_args['drop_out'],
-#                 num_heads=RAB_args['num_heads'],
-#                 dim_feedforward=RAB_args['dim_feedforward'])
-#             for _ in range(RAB_args['layer_num'])
-#         ])
-
-#         # 特征嵌入层，通常用于映射特征
-#         self.feature_embedding = nn.Sequential(
-#             nn.Conv1d(in_channels=self.feature_dim, out_channels=self.feature_dim, kernel_size=3, stride=1, padding=1),
-#             nn.ReLU(),
-#         )
-
-#     def forward(self, input_features, prototypes=None):
-#         '''
-#         input_features: [B, T, F] -> 每个patch的特征，来自DronePatchExtractor的聚类结果
-#         prototypes：[C,1,F] -> 可学习的原型向量
-#         '''
-#         B, T, F = input_features.shape
-
-        
-#         input_features = input_features.permute(0, 2, 1)                        #[B,F,T]
-#         prototypes = prototypes.to(input_features.device)                       #[C,1,F]
-#         prototypes = prototypes.view(1,F,-1).expand(B,-1,-1)                    #[B,F,C]
-
-#         # 多层RAB处理
-#         for layer in self.RAB:
-#             input_features, _ = layer(input_features)
-
-#         # 最终特征嵌入
-#         embeded_features = self.feature_embedding(input_features)  # [B, F, T]
-
-#         return embeded_features
-class Encoder(nn.Module):
-    def __init__(self, args):
-        super(Encoder, self).__init__()
-        self.feature_dim = args.feature_dim  # 输入特征维度
-
-        # RAB args
-        RAB_args = args.RAB_args
-        self.RAB = nn.ModuleList([  # 初始化多个 Reliabilty_Aware_Block
-            Reliabilty_Aware_Block(
-                input_dim=self.feature_dim,
-                dropout=RAB_args['drop_out'],
-                num_heads=RAB_args['num_heads'],
-                dim_feedforward=RAB_args['dim_feedforward'])
-            for _ in range(RAB_args['layer_num'])
-        ])
-
-        # 特征嵌入层，通常用于映射特征
-        self.feature_embedding = nn.Sequential(
-            nn.Conv1d(in_channels=self.feature_dim, out_channels=self.feature_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-        )
-
-    def forward(self, clustered_patches, prototypes=None):
-        '''
-        clustered_patches: [B, T, F] -> 每个patch的特征，来自DronePatchExtractor的聚类结果
-        prototypes: [C,1,F] -> 可学习的原型向量 (可选，如果需要)
-        '''
-        B, T, F = clustered_patches.shape  # 获取批量大小、时间步数和特征维度
-
-        # 将输入特征转换为 [B, F, T] 以适配后续的处理流程
-        input_features = clustered_patches.permute(0, 2, 1)  # [B, F, T] -> [B, F, T] (通道维度F，时间步T)
-        
-        # 如果有原型向量 (prototypes)，可以在这里进行处理（如果需要的话）
-        if prototypes is not None:
-            prototypes = prototypes.to(input_features.device)  # 确保原型向量和输入特征在同一设备上
-            prototypes = prototypes.view(1, F, -1).expand(B, -1, -1)  # 扩展原型向量，以便与输入特征进行结合（如果需要）
-
-        # 多层RAB处理
-        for layer in self.RAB:
-            input_features, _ = layer(input_features)
-
-        # 最终特征嵌入
-        embeded_features = self.feature_embedding(input_features)  # [B, F, T] 特征嵌入
-
-        return embeded_features
-
-
 
 @BACKBONES.register_module()
-# class SwinTransformerV1(BaseModule):
-#     """ Swin Transformer backbone with additional memory block. """
-    
-#     def __init__(self,
-#                  pretrain_img_size=224,
-#                  patch_size=4,
-#                  in_chans=3,
-#                  embed_dim=96,
-#                  depths=[2, 2, 6, 2],
-#                  num_heads=[3, 6, 12, 24],
-#                  window_size=7,
-#                  mlp_ratio=4.,
-#                  qkv_bias=True,
-#                  qk_scale=None,
-#                  drop_rate=0.,
-#                  attn_drop_rate=0.,
-#                  drop_path_rate=0.2,
-#                  norm_layer=nn.LayerNorm,
-#                  ape=False,
-#                  patch_norm=True,
-#                  out_indices=(0, 1, 2, 3),
-#                  frozen_stages=-1,
-#                  use_checkpoint=False,
-#                  pretrained=None,
-#                  init_cfg=None,
-#                  num_classes=80
-#                  ):
-#         assert init_cfg is None, 'To prevent abnormal initialization ' \
-#                                  'behavior, init_cfg is not allowed to be set'
-#         super().__init__(init_cfg=init_cfg)
-
-#         self.pretrain_img_size = pretrain_img_size
-#         self.num_layers = len(depths)
-#         self.embed_dim = embed_dim
-#         self.ape = ape
-#         self.patch_norm = patch_norm
-#         self.out_indices = out_indices
-#         self.frozen_stages = frozen_stages
-#         self.pretrained = pretrained
-#         self.memory=torch.zeros([batch_size, num_classes, embed_dim])
-        
-    
-
-#         # split image into non-overlapping patches
-#         self.patch_embed = PatchEmbed(
-#             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
-#             norm_layer=norm_layer if self.patch_norm else None)
-
-#         # absolute position embedding
-#         if self.ape:
-#             pretrain_img_size = to_2tuple(pretrain_img_size)
-#             patch_size = to_2tuple(patch_size)
-#             patches_resolution = [pretrain_img_size[0] // patch_size[0], pretrain_img_size[1] // patch_size[1]]
-
-#             self.absolute_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, patches_resolution[0], patches_resolution[1]))
-#             trunc_normal_(self.absolute_pos_embed, std=.02)
-
-#         self.pos_drop = nn.Dropout(p=drop_rate)
-
-#         # stochastic depth
-#         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
-
-#         # define SwinTransformerBlockWithMemory
-#         self.memory_block = SwinTransformerBlockWithMemory(
-#             dim=embed_dim, num_heads=num_heads[0], window_size=window_size,
-#             shift_size=window_size // 2, mlp_ratio=mlp_ratio,
-#             qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-#             attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer)
-
-#         # build layers (BasicLayer)
-#         self.layers = nn.ModuleList()
-#         for i_layer in range(self.num_layers):
-#             layer = BasicLayer(
-#                 dim=int(embed_dim * 2 ** i_layer),
-#                 depth=depths[i_layer],
-#                 num_heads=num_heads[i_layer],
-#                 window_size=window_size,
-#                 mlp_ratio=mlp_ratio,
-#                 qkv_bias=qkv_bias,
-#                 qk_scale=qk_scale,
-#                 drop=drop_rate,
-#                 attn_drop=attn_drop_rate,
-#                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-#                 norm_layer=norm_layer,
-#                 downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-#                 use_checkpoint=use_checkpoint)
-#             self.layers.append(layer)
-
-#         num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
-#         self.num_features = num_features
-
-#         # add a norm layer for each output
-#         for i_layer in out_indices:
-#             layer = norm_layer(num_features[i_layer])
-#             layer_name = f'norm{i_layer}'
-#             self.add_module(layer_name, layer)
-
-#         self._freeze_stages()
-    
-#     def memory_init(self, memory):
-#         self.memory=memory
-#     def _freeze_stages(self):
-#         if self.frozen_stages >= 0:
-#             self.patch_embed.eval()
-#             for param in self.patch_embed.parameters():
-#                 param.requires_grad = False
-
-#         if self.frozen_stages >= 1 and self.ape:
-#             self.absolute_pos_embed.requires_grad = False
-
-#         if self.frozen_stages >= 2:
-#             self.pos_drop.eval()
-#             for i in range(0, self.frozen_stages - 1):
-#                 m = self.layers[i]
-#                 m.eval()
-#                 for param in m.parameters():
-#                     param.requires_grad = False
-#     def init_weights(self):
-#         """Initialize the weights in backbone."""
-
-#         def _init_weights(m):
-#             if isinstance(m, nn.Linear):
-#                 trunc_normal_(m.weight, std=.02)
-#                 if isinstance(m, nn.Linear) and m.bias is not None:
-#                     nn.init.constant_(m.bias, 0)
-#             elif isinstance(m, nn.LayerNorm):
-#                 nn.init.constant_(m.bias, 0)
-#                 nn.init.constant_(m.weight, 1.0)
-
-#         if isinstance(self.pretrained, str):
-#             self.apply(_init_weights)
-#             logger = get_root_logger()
-#             load_checkpoint(self, self.pretrained, strict=False, logger=logger)
-#         elif self.pretrained is None:
-#             self.apply(_init_weights)
-#         else:
-#             raise TypeError('pretrained must be a str or None')
-#     def sample_label_tokens(self, x, num_classes=80, labels=None):
-#         """
-#         通过 DronePatchExtractor 从输入图像中提取与标签相关的 patch 并返回。
-        
-#         Args:
-#             x (Tensor): 输入图像数据，形状为 [B, C, H, W]
-#             num_classes (int): 类别数，默认为 80
-#             labels (List[List[Tuple[int, int, int, int]]]): 每张图像的边界框列表
-#                 格式为 [(xmin, ymin, w, h), ...]，每个图像的标签包含多个边界框。
-
-#         Returns:
-#             Tensor: 根据标签提取的 token 张量
-#         """
-#         # 使用 DronePatchExtractor 提取 Drone 的 patches
-#         drone_patches = self.patch_extractor.extract_drone_patches_with_bbox(x, labels)
-
-#         # 如果没有标签，抛出异常
-#         if labels is None:
-#             raise ValueError("Labels must be provided to sample tokens.")
-
-#         # 聚类操作：
-#         clustered_patches = self.patch_extractor.cluster_patches(drone_patches, num_clusters=num_classes)
-
-#         # 将聚类结果转换为 tensor
-#         clustered_patches_tensor = []
-#         for cluster in clustered_patches:
-#             clustered_patches_tensor.append(torch.stack([patch for patch in cluster], dim=0))
-
-#         # 最后返回聚类后的 token
-#         return clustered_patches_tensor
-        
-# #增加输进聚类结果作为输入
-#     def forward(self, x ,clustered_patches_tensor):
-#         """Forward function."""
-#         x = self.patch_embed(x)
-
-#         Wh, Ww = x.size(2), x.size(3)
-#         if self.ape:
-#             # interpolate the position embedding to the corresponding size
-#             absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
-#             x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
-#         else:
-#             x = x.flatten(2).transpose(1, 2)
-#         x = self.pos_drop(x)
-
-#         # Pass through memory block 
-#         attn_mask = None  # 
-#         x = self.encoder(x, attn_mask, self.memory) #返回增强后的图像特征
-
-#         # Now pass through BasicLayer
-#         outs = []
-#         for i in range(self.num_layers):
-#             layer = self.layers[i]
-#             x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
-
-#             if i in self.out_indices:
-#                 norm_layer = getattr(self, f'norm{i}')
-#                 x_out = norm_layer(x_out)
-
-#                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
-#                 outs.append(out)
-
-#         return tuple(outs)
-
-#     def train(self, mode=True):
-#         """Convert the model into training mode while keep layers freezed."""
-#         super(SwinTransformerV1, self).train(mode)
-#         self._freeze_stages()
 class SwinTransformerV1(BaseModule):
-    """Swin Transformer backbone with Encoder and Reliability_Aware_Block for memory handling."""
-
+    """ Swin Transformer backbone with additional memory block. """
+    
     def __init__(self,
                  pretrain_img_size=224,
                  patch_size=4,
@@ -934,9 +504,10 @@ class SwinTransformerV1(BaseModule):
                  use_checkpoint=False,
                  pretrained=None,
                  init_cfg=None,
-                 num_classes=80,
-                 feature_dim=128,
-                 RAB_args=None):
+                 num_classes=80
+                 ):
+        assert init_cfg is None, 'To prevent abnormal initialization ' \
+                                 'behavior, init_cfg is not allowed to be set'
         super().__init__(init_cfg=init_cfg)
 
         self.pretrain_img_size = pretrain_img_size
@@ -947,29 +518,37 @@ class SwinTransformerV1(BaseModule):
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
         self.pretrained = pretrained
+        self.memory=torch.zeros([batch_size, num_classes, embed_dim])
+        
+    
 
-        # Memory tensor for storing prototypes
-        self.memory = torch.zeros(num_classes, feature_dim)
-
-        # Patch embedding
+        # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
 
-        # Absolute position embedding
+        # absolute position embedding
         if self.ape:
             pretrain_img_size = to_2tuple(pretrain_img_size)
             patch_size = to_2tuple(patch_size)
             patches_resolution = [pretrain_img_size[0] // patch_size[0], pretrain_img_size[1] // patch_size[1]]
+
             self.absolute_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, patches_resolution[0], patches_resolution[1]))
             trunc_normal_(self.absolute_pos_embed, std=.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # Stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
-        # Basic layers
+        # define SwinTransformerBlockWithMemory
+        self.memory_block = SwinTransformerBlockWithMemory(
+            dim=embed_dim, num_heads=num_heads[0], window_size=window_size,
+            shift_size=window_size // 2, mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+            attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer)
+
+        # build layers (BasicLayer)
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
@@ -988,19 +567,19 @@ class SwinTransformerV1(BaseModule):
                 use_checkpoint=use_checkpoint)
             self.layers.append(layer)
 
-        # Add a norm layer for each output
         num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
         self.num_features = num_features
+
+        # add a norm layer for each output
         for i_layer in out_indices:
             layer = norm_layer(num_features[i_layer])
             layer_name = f'norm{i_layer}'
             self.add_module(layer_name, layer)
 
-        # Initialize Encoder
-        self.encoder = Encoder(args=type('args', (object,), {'feature_dim': feature_dim, 'RAB_args': RAB_args}))
-
         self._freeze_stages()
-
+    ###
+    def memory_init(self, memory):
+        self.memory=memory
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
             self.patch_embed.eval()
@@ -1017,13 +596,13 @@ class SwinTransformerV1(BaseModule):
                 m.eval()
                 for param in m.parameters():
                     param.requires_grad = False
-
     def init_weights(self):
         """Initialize the weights in backbone."""
+
         def _init_weights(m):
             if isinstance(m, nn.Linear):
                 trunc_normal_(m.weight, std=.02)
-                if m.bias is not None:
+                if isinstance(m, nn.Linear) and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
@@ -1037,47 +616,48 @@ class SwinTransformerV1(BaseModule):
             self.apply(_init_weights)
         else:
             raise TypeError('pretrained must be a str or None')
-
-    def forward(self, x, labels, prototypes=None):
-        """
-        Forward pass with input x and optional prototypes.
-        Args:
-            x: Input image tensor, shape [B, C, H, W]
-            labels: List of bounding boxes for patch extraction
-            prototypes: Optional memory prototypes for encoder
-        """
-        # Step 1: Extract patches
-        patch_extractor = DronePatchExtractor()
-        clustered_patches = patch_extractor.forward(x, labels)
-        clustered_patches_tensor = torch.stack([torch.cat(cluster, dim=0) for cluster in clustered_patches])
-
-        # Step 2: Pass through Encoder
-        encoded_features = self.encoder(clustered_patches_tensor, prototypes)
-
-        # Step 3: Patch embedding and BasicLayer processing
+    def sample_label_tokens (self, x, num_classes=80 ,labels=None):
+        """Initialize the memory with the given input."""
         x = self.patch_embed(x)
+        ##传入x、label，挑选tokens
+
+        
+        return x
+        
+#增加输进聚类结果作为输入
+    def forward(self, x):
+        """Forward function."""
+        x = self.patch_embed(x)
+
         Wh, Ww = x.size(2), x.size(3)
         if self.ape:
+            # interpolate the position embedding to the corresponding size
             absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
-            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)
+            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
         else:
             x = x.flatten(2).transpose(1, 2)
         x = self.pos_drop(x)
 
-        # Pass through BasicLayer
+        # Pass through memory block (SwinTransformerBlockWithMemory)
+        attn_mask = None  # 
+        x = self.memory_block(x, attn_mask, self.memory)#返回增强后的图像特征
+
+        # Now pass through BasicLayer
         outs = []
-        for i, layer in enumerate(self.layers):
+        for i in range(self.num_layers):
+            layer = self.layers[i]
             x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
+
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 x_out = norm_layer(x_out)
+
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs.append(out)
 
         return tuple(outs)
+
     def train(self, mode=True):
         """Convert the model into training mode while keep layers freezed."""
         super(SwinTransformerV1, self).train(mode)
         self._freeze_stages()
-
-

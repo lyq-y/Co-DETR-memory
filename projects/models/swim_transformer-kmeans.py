@@ -75,7 +75,7 @@ class DronePatchExtractor(nn.Module):
         # 卷积操作，用于将图像划分为不重叠的patch
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
         
-        # 位置编码：简单的learnable位置嵌入
+        # 位置编码：
         self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, self.patch_size[0], self.patch_size[1]))
 
         if norm_layer is not None:
@@ -96,7 +96,7 @@ class DronePatchExtractor(nn.Module):
         # 展平每个patch，并加上位置编码
         patches = patches.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
 
-        # 对patch进行归一化（如果需要）
+        # 对patch进行归一化
         if self.norm:
             patches = self.norm(patches)
         
@@ -362,3 +362,228 @@ class SwinTransformerV1(BaseModule):
         """Convert the model into training mode while keep layers freezed."""
         super(SwinTransformerV1, self).train(mode)
         self._freeze_stages()
+
+
+
+# Kmeans batchsize=1000
+
+class DronePatchExtractor(nn.Module):
+    def __init__(self, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None, num_classes=80):
+        super().__init__()
+        self.patch_size = self.to_2tuple(patch_size)
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
+
+        # 卷积操作，用于将图像划分为不重叠的patch
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
+        
+        # 位置编码
+        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, self.patch_size[0], self.patch_size[1]))
+
+        # 如果需要归一化
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def to_2tuple(self, x):
+        return (x, x) if isinstance(x, int) else x
+
+    def extract_drone_patches_with_bbox(self, images, labels):
+        """
+        根据标签中的边界框提取包含Drone的patch。
+
+        Args:
+            images (Tensor): 输入的图像数据，形状为 [B, C, H, W]
+            labels (List[List[Tuple[int, int, int, int]]]): 每张图的目标边界框列表，
+                格式为 [(xmin, ymin, w, h), ...]，每个图像的标签是一个边界框的列表。
+
+        Returns:
+            List[Tensor]: 含有目标Drone的patch列表
+        """
+        drone_patches = []
+        patch_size = self.patch_size[0]
+
+        for img, bbox_list in zip(images, labels):
+            patches = self.forward(img.unsqueeze(0))  # 获取patch特征
+            h_img, w_img = img.shape[1:]  # 获取图像尺寸
+
+            # 遍历每个边界框（每张图可能有多个目标Drone）
+            for bbox in bbox_list:
+                xmin, ymin, w, h = bbox
+                xmax = xmin + w
+                ymax = ymin + h
+
+                # 遍历每个patch
+                for i in range(0, h_img - patch_size + 1, patch_size):
+                    for j in range(0, w_img - patch_size + 1, patch_size):
+                        # 计算当前patch的范围
+                        patch_x_min = j
+                        patch_y_min = i
+                        patch_x_max = j + patch_size
+                        patch_y_max = i + patch_size
+
+                        # 判断是否与目标范围有交集
+                        if not (patch_x_max <= xmin or patch_x_min >= xmax or
+                                patch_y_max <= ymin or patch_y_min >= ymax):
+                            # 如果有交集，将patch保存
+                            drone_patches.append(patches[0, :, i // patch_size, j // patch_size])
+
+        return drone_patches
+
+    def cluster_patches(self, drone_patches, num_clusters=80, batch_size=1000):
+        """
+        对Drone patches进行两阶段聚类，首先对patch进行批次聚类，然后对所有聚类结果再次聚类。
+
+        Args:
+            drone_patches (List[Tensor]): 待聚类的Drone patches列表
+            num_clusters (int): 聚类的数量
+            batch_size (int): 每次聚类处理的patch数量
+
+        Returns:
+            List[List[Tensor]]: 最终聚类后的patch列表，每个元素是一个集群中所有patch的列表
+        """
+        # 第一阶段聚类结果
+        clustered_patches = []  # 存储第一阶段聚类后的patch列表
+        patch_batch = []  # 用于存储当前批次的patch
+
+        # 遍历所有的patch
+        for i, patch in enumerate(drone_patches):
+            patch_batch.append(patch.flatten().cpu().numpy())  # 将每个patch展平并存储
+
+            # 一旦积累的patch数量达到batch_size，就进行一次聚类
+            if len(patch_batch) == batch_size or i == len(drone_patches) - 1:
+                # 将当前批次的所有patch特征堆叠成二维数组（每个patch的特征是一维的）
+                patch_features = np.stack(patch_batch)
+
+                # 执行KMeans聚类
+                kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+                kmeans.fit(patch_features)
+
+                # 根据聚类结果将patch分组
+                for cluster_idx in range(num_clusters):
+                    cluster_patches = [drone_patches[j] for j in range(len(patch_batch)) if kmeans.labels_[j] == cluster_idx]
+                    clustered_patches.append(cluster_patches)
+
+                # 处理完当前批次后，清空patch_batch，释放内存
+                patch_batch.clear()
+
+        # 第二阶段聚类：对第一阶段得到的所有聚类结果进行二次聚类
+        # 将所有的集群patch展平为特征向量
+        all_cluster_patches = []
+        for cluster in clustered_patches:
+            for patch in cluster:
+                all_cluster_patches.append(patch.flatten().cpu().numpy())
+
+        # 进行第二阶段KMeans聚类
+        patch_features_final = np.stack(all_cluster_patches)
+        kmeans_final = KMeans(n_clusters=num_clusters, random_state=42)
+        kmeans_final.fit(patch_features_final)
+
+        # 将最终聚类的结果根据标签重新分组
+        final_clustered_patches = [[] for _ in range(num_clusters)]
+        for idx, label in enumerate(kmeans_final.labels_):
+            final_clustered_patches[label].append(all_cluster_patches[idx])
+
+        return final_clustered_patches
+
+    def forward(self, images, labels, num_clusters=80, batch_size=1000):
+        """
+        计算整个前向过程，包括提取Drone patches、聚类操作。
+
+        Args:
+            images (Tensor): 输入的图像数据，形状为 [B, C, H, W]
+            labels (List[List[Tuple[int, int, int, int]]]): 每张图的目标边界框列表，
+                格式为 [(xmin, ymin, w, h), ...]，每个图像的标签是一个边界框的列表。
+            num_clusters (int): 聚类的数量
+            batch_size (int): 每次聚类处理的patch数量
+
+        Returns:
+            List[List[Tensor]]: 最终聚类后的patch列表，每个元素是一个集群中所有patch的列表
+        """
+        # 步骤 1：根据标签提取Drone patches
+        drone_patches = self.extract_drone_patches_with_bbox(images, labels)
+
+        # 步骤 2：对提取的Drone patches进行聚类
+        clustered_patches = self.cluster_patches(drone_patches, num_clusters, batch_size)
+
+        return clustered_patches
+    
+
+class Reliabilty_Aware_Block(nn.Module):
+    def __init__(self, input_dim, dropout, num_heads=8, dim_feedforward=128):
+        super(Reliabilty_Aware_Block, self).__init__()
+        self.conv_query = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
+        self.conv_key = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
+        self.conv_value = nn.Conv1d(input_dim, input_dim, kernel_size=1, stride=1, padding=0)
+
+        self.self_atten = nn.MultiheadAttention(input_dim, num_heads=num_heads, dropout=0.1)
+        self.linear1 = nn.Linear(input_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, input_dim)
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, features, attn_mask=None):
+        src = features.permute(2, 0, 1)  # [T, B, F]
+        q = k = src
+        q = self.conv_query(features).permute(2, 0, 1)
+        k = self.conv_key(features).permute(2, 0, 1)
+
+        src2, attn = self.self_atten(q, k, src, attn_mask=attn_mask)
+
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+
+        src = src.permute(1, 2, 0)  # [B, F, T]
+        return src, attn
+
+
+class Encoder(nn.Module):
+    def __init__(self, args):
+        super(Encoder, self).__init__()
+        self.feature_dim = args.feature_dim  # 输入特征维度
+
+        # RAB args
+        RAB_args = args.RAB_args
+        self.RAB = nn.ModuleList([
+            Reliabilty_Aware_Block(
+                input_dim=self.feature_dim,
+                dropout=RAB_args['drop_out'],
+                num_heads=RAB_args['num_heads'],
+                dim_feedforward=RAB_args['dim_feedforward'])
+            for _ in range(RAB_args['layer_num'])
+        ])
+
+        # 特征嵌入层，通常用于映射特征
+        self.feature_embedding = nn.Sequential(
+            nn.Conv1d(in_channels=self.feature_dim, out_channels=self.feature_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+
+    def forward(self, input_features, prototypes=None):
+        '''
+        input_features: [B, T, F] -> 每个patch的特征，来自DronePatchExtractor的聚类结果
+        prototypes：[C,1,F] -> 可学习的原型向量
+        '''
+        B, T, F = input_features.shape
+
+        
+        input_features = input_features.permute(0, 2, 1)                        #[B,F,T]
+        prototypes = prototypes.to(input_features.device)                       #[C,1,F]
+        prototypes = prototypes.view(1,F,-1).expand(B,-1,-1)                    #[B,F,C]
+
+        # 多层RAB处理
+        for layer in self.RAB:
+            input_features, _ = layer(input_features)
+
+        # 最终特征嵌入
+        embeded_features = self.feature_embedding(input_features)  # [B, F, T]
+
+        return embeded_features

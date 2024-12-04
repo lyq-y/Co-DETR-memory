@@ -441,9 +441,4 @@ runner = dict(type='EpochBasedRunner', max_epochs=12)
 pretrained = 'models/swin_large_patch4_window12_384_22k.pth'
 work_dir = '/home/liuyuqing/liuyuqing/code/Co-DETR-memory/results/ARD1'
 auto_resume = False
-gpu_ids = 0
-#nohup bash tools/dist_train.sh /home/liuyuqing/liuyuqing/code/Co-DETR/results/ARD/co_dino_5scale_swin_large_1x_coco.py 4 /home/liuyuqing/liuyuqing/code/Co-DETR/results/ARD1 > train2.log 2>&1 & disown
-#nohup bash tools/dist_test.sh  /home/liuyuqing/liuyuqing/code/Co-DETR/results/ARD/co_dino_5scale_swin_large_1x_coco.py /home/liuyuqing/liuyuqing/code/Co-DETR/results/ARD1/epoch_9.pth 4 --eval bbox > test-ARD.log 2>&1 & disown
-
-#nohup bash tools/dist_train.sh /home/liuyuqing/liuyuqing/code/Co-DETR/results/Drone-vs-Bird/co_dino_5scale_swin_large_1x_coco.py 4 /home/liuyuqing/liuyuqing/code/Co-DETR/results/Drone-vs-Bird > train.log 2>&1 & disown
-#nohup bash tools/dist_test.sh /home/liuyuqing/liuyuqing/code/Co-DETR/results/Drone-vs-Bird/co_dino_5scale_swin_large_1x_coco.py /home/liuyuqing/liuyuqing/code/Co-DETR/results/Drone-vs-Bird/epoch_1.pth 4 --eval bbox > test-Drone-vs-Bird.log 2>&1 & disown
+gpu_ids = [0]
